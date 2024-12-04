@@ -1,8 +1,8 @@
 const express = require("express");
-const { Server } = require("socket.io");
 const http = require("http");
 const amqp = require("amqplib");
 const admin = require("firebase-admin");
+require("dotenv").config();
 
 const { AmqpConstants, NotificationConstants } = require("./constants.js");
 
@@ -16,70 +16,83 @@ admin.initializeApp({
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
 
 // Socket.io configuration
-io.on("connection", (socket) => {
-  console.log(`User connected: ${socket.id}`);
-
-  socket.on("joinRoom", (data) => {
-    socket.join(data.room);
-    socket.emit("joinedRoom", data.room);
-  });
-
-  socket.on("disconnect", () => {
-    console.log(`User disconnected: ${socket.id}`);
-  });
-});
+// io.on("connection", (socket) => {
+//   console.log(`User connected: ${socket.id}`);
+//
+//   socket.on("joinRoom", (data) => {
+//     socket.join(data.room);
+//     socket.emit("joinedRoom", data.room);
+//   });
+//
+//   socket.on("disconnect", () => {
+//     console.log(`User disconnected: ${socket.id}`);
+//   });
+// });
 
 // Amqp configuration
 (async () => {
-  const connection = await amqp.connect(
-    `amqp://${process.env.RABBITMQ_USER}:${process.env.RABBITMQ_PASSWORD}@${process.env.RABBITMQ_HOST}:${process.env.RABBITMQ_PORT}${process.env.RABBITMQ_VHOST}`,
-  );
-  const channel = await connection.createChannel();
-  await channel.assertQueue(AmqpConstants.QUEUE_NAME);
+  try {
+    const connection = await amqp.connect(
+      `amqp://${process.env.RABBITMQ_USER}:${process.env.RABBITMQ_PASSWORD}@${process.env.RABBITMQ_HOST}:${process.env.RABBITMQ_PORT}${process.env.RABBITMQ_VHOST}`,
+    );
+    const channel = await connection.createChannel();
+    await channel.assertQueue(AmqpConstants.QUEUE_NAME, {
+      durable: true,
+    });
 
-  console.log("Connected to RabbitMQ. Waiting for messages...");
+    console.log("Connected to RabbitMQ. Waiting for messages...");
 
-  channel.consume(AmqpConstants.QUEUE_NAME, (message) => {
-    const messageData = JSON.parse(message.content.toString());
-    const room = messageData.content.roomName;
-    const deviceTokens = messageData.content.deviceTokens;
+    channel.consume(AmqpConstants.QUEUE_NAME, async (message) => {
+      const messageData = JSON.parse(message.content.toString());
+      const deviceTokens = messageData.content.deviceTokens;
 
-    if (room) {
-      sendNotificationToSocketRoom(room, messageData.content.notification);
-    }
+      if (deviceTokens.length > 0) {
+        for (const deviceToken of deviceTokens) {
+          const sendMessage = {
+            notification: {
+              title: messageData.content.notification.title,
+              body: messageData.content.notification.content,
+            },
+            data: Object.fromEntries(
+              Object.entries(messageData.content.notification).map(
+                ([key, value]) => [key, JSON.stringify(value)],
+              ),
+            ),
+            token: deviceToken,
+          };
 
-    if (deviceTokens.length > 0) {
-      deviceTokens.forEach((deviceToken) => {
-        const sendMessage = {
-          notification: {
-            title: messageData.content.notification.title,
-            body: messageData.content.notification.content,
-          },
-          token: deviceToken,
-        };
+          await admin
+            .messaging()
+            .send(sendMessage)
+            .then((response) => {
+              console.log(
+                `Successfully sent ${messageData.content.notification.type} message:`,
+                response,
+              );
+            })
+            .catch((error) => {
+              console.log(
+                `Error sending ${messageData.content.notification.type} message:`,
+                error,
+              );
+              console.log("Failed message:", sendMessage);
+            });
+        }
+      }
 
-        admin
-          .messaging()
-          .send(sendMessage)
-          .then((response) => {
-            console.log("Successfully sent message:", response);
-            channel.ack(message);
-          })
-          .catch((error) => {
-            console.log("Error sending message:", error);
-          });
-      });
-    }
-  });
+      channel.ack(message);
+    });
+  } catch (error) {
+    console.error("Error connecting to RabbitMQ:", error);
+  }
 })();
 
 server.listen(8081, () => {
   console.log("Server is running on port 8081");
 });
 
-function sendNotificationToSocketRoom(roomName, message) {
-  io.to(roomName).emit(NotificationConstants.EVENT_NAME, message);
-}
+// function sendNotificationToSocketRoom(roomName, message) {
+//   io.to(roomName).emit(NotificationConstants.EVENT_NAME, message);
+// }
